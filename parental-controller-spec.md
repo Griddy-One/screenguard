@@ -233,6 +233,7 @@ Sent after `agent_hello` if agent's config version is stale, and whenever config
         "adjustments_today": 0,
         "lockout_grace_minutes": 5,
         "preserve_tasks_on_lock": false,
+        "manual_locked": false,
         "warning_thresholds_minutes": [15, 5, 1]
       }
     ]
@@ -245,6 +246,7 @@ Sent after `agent_hello` if agent's config version is stale, and whenever config
 - `schedules`: if none defined for a user, all times are allowed.
 - `adjustments_today`: net sum of all time adjustments for today (minutes, can be negative).
 - `preserve_tasks_on_lock`: optional for backwards compatibility and defaults to `false` when absent.
+- `manual_locked`: persistent parent-controlled lock state; optional for backwards compatibility and defaults to `false` when absent.
 
 #### `remaining_update`
 Sent in response to each heartbeat and after usage_sync. Pushed to **all agents** linked to the same profile.
@@ -272,7 +274,7 @@ Sent in response to each heartbeat and after usage_sync. Pushed to **all agents*
 - `enforce`: one of `"allow"`, `"warn"`, `"lock"`.
   - `allow`: user may continue.
   - `warn`: remaining time is within a warning threshold — agent should notify the user.
-  - `lock`: remaining time is 0 or user is outside schedule — agent must lock the session and either preserve or terminate it according to `preserve_tasks_on_lock`.
+  - `lock`: manual lock is active, remaining time is 0, or user is outside schedule — agent must lock the session and either preserve or terminate it according to `preserve_tasks_on_lock`.
 - `current_window_ends_at`: when the current schedule window closes (null if no schedule / unlimited).
 - `next_window_starts_at`: next allowed window today (null if none remain).
 
@@ -301,8 +303,8 @@ Sent when admin triggers immediate lock for a user.
 }
 ```
 
-This is implemented server-side as a time adjustment that zeros remaining time, but the
-explicit message ensures instant enforcement without waiting for the next heartbeat cycle.
+The server first persists the profile's manual-lock state. The explicit message provides
+instant enforcement without waiting for the updated configuration and remaining state.
 
 #### `config_reload`
 Tells the agent to re-fetch and re-apply its cached config without restarting.
@@ -340,6 +342,7 @@ pub struct UserConfig {
     pub adjustments_today: i32,
     pub lockout_grace_minutes: u32,
     pub preserve_tasks_on_lock: bool, // serde default: false
+    pub manual_locked: bool, // serde default: false
     pub warning_thresholds_minutes: Vec<u32>,
 }
 
@@ -473,6 +476,7 @@ CREATE TABLE cached_enforcement (
     lockout_grace_minutes   INTEGER NOT NULL DEFAULT 5,
     warning_thresholds      TEXT NOT NULL DEFAULT '15,5,1',  -- comma-separated minutes
     preserve_tasks_on_lock  INTEGER NOT NULL DEFAULT 0,
+    manual_locked           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (local_uid)
 );
 
@@ -728,7 +732,8 @@ CREATE TABLE enforcement_settings (
     profile_id              UUID PRIMARY KEY REFERENCES user_profiles(id) ON DELETE CASCADE,
     lockout_grace_minutes   INTEGER NOT NULL DEFAULT 5,
     warning_thresholds      TEXT NOT NULL DEFAULT '15,5,1',  -- comma-separated minutes
-    preserve_tasks_on_lock  BOOLEAN NOT NULL DEFAULT false
+    preserve_tasks_on_lock  BOOLEAN NOT NULL DEFAULT false,
+    manual_locked           BOOLEAN NOT NULL DEFAULT false
 );
 
 -- Daily usage per agent_user (granular: per device)
@@ -806,6 +811,7 @@ today = current date in agent's timezone
 
 4. remaining = limit_today + adjustments_today - used_today_minutes
    → cap at 0 minimum
+   → manual lock does not change this allowance value
 
 5. Check schedule: is current time (in agent's timezone) within any schedule window?
    → If no schedules defined: always in window
@@ -813,6 +819,7 @@ today = current date in agent's timezone
    → If inside a window: cap remaining by minutes until window ends
 
 6. Determine enforce action:
+   → manual_locked: "lock"
    → remaining <= 0: "lock"
    → remaining <= min(warning_thresholds): "warn"
    → else: "allow"
@@ -821,7 +828,7 @@ today = current date in agent's timezone
 Update `daily_usage` with the new seconds, then send `remaining_update` to **all connected agents** that have agent_users linked to this profile.
 
 #### Config Change Propagation
-When admin changes schedules/limits/adjustments via REST API:
+When admin changes schedules/limits/adjustments/manual lock via REST API:
 1. Update the database.
 2. Bump `config_versions.version` for the affected profile.
 3. Insert into `audit_log`.
@@ -903,7 +910,7 @@ All endpoints except `/api/v1/auth/*` require JWT in `Authorization: Bearer <tok
 |--------|------|-------------|
 | `GET` | `/profiles` | List all profiles |
 | `POST` | `/profiles` | Create a profile |
-| `GET` | `/profiles/:id` | Get profile with schedules, limits, linked agent_users, and lock behavior |
+| `GET` | `/profiles/:id` | Get profile with schedules, limits, linked agent_users, lock behavior, and manual-lock state |
 | `PATCH` | `/profiles/:id` | Update profile (`display_name`, `language`, or optional `preserve_tasks_on_lock`) |
 | `DELETE` | `/profiles/:id` | Delete profile |
 
@@ -971,7 +978,8 @@ Days not included have no limit (unlimited, still bound by schedule).
 |--------|------|-------------|
 | `GET` | `/profiles/:id/adjustments` | List adjustments (filterable by date) |
 | `POST` | `/profiles/:id/adjustments` | Add a time adjustment |
-| `POST` | `/profiles/:id/lock-now` | Lock now (zero remaining time for today) |
+| `POST` | `/profiles/:id/lock-now` | Set the persistent manual lock |
+| `POST` | `/profiles/:id/unlock` | Clear the persistent manual lock |
 
 **POST `/profiles/:id/adjustments`**
 ```json
@@ -984,9 +992,13 @@ Days not included have no limit (unlimited, still bound by schedule).
 **POST `/profiles/:id/lock-now`**
 ```json
 // Response 200
-{ "message": "Lock command sent", "adjustment_id": "uuid" }
+{ "message": "Profile manually locked", "manual_locked": true }
 ```
-Internally: inserts a negative adjustment to zero remaining time, then sends `lock_now` to all connected agents with agent_users linked to this profile.
+Internally: persists `manual_locked = true`, propagates the new configuration/enforcement state, and sends `lock_now` to connected agents for immediate enforcement. It does not change daily limits, usage, or time adjustments. Repeating the operation is harmless.
+
+**POST `/profiles/:id/unlock`** clears only `manual_locked` and then recomputes normal enforcement. It does not grant time or override schedules or exhausted allowances. Repeating it is harmless.
+
+Historical adjustments whose reason is `lock_now` or `unlock` are retained and continue to contribute to their recorded day's adjustment total. New Lock Now and Unlock operations do not create either kind of adjustment.
 
 #### Usage & Dashboard
 
@@ -1219,6 +1231,9 @@ fn evaluate_enforcement(user, now, timezone) -> EnforceAction:
         today = now.date()
         weekday = today.weekday()  // 0=Mon
 
+        if cached_enforcement[user].manual_locked:
+            return Lock
+
         // 2. Check schedule
         windows = cached_schedules.filter(user, weekday)
         if windows.is_empty():
@@ -1252,12 +1267,16 @@ fn evaluate_enforcement(user, now, timezone) -> EnforceAction:
 
 ### 9.2 Lock Execution
 
-The per-profile `preserve_tasks_on_lock` setting defaults to **off**, preserving existing ScreenGuard behavior. Both modes lock immediately when access is blocked and Lock now continues to zero the remaining allowance.
+The per-profile `preserve_tasks_on_lock` setting defaults to **off**, preserving existing ScreenGuard behavior. Both modes lock immediately when access is blocked. Manual Lock Now is an orthogonal persistent restriction and does not change the remaining allowance.
 
 - **Preserve tasks off (default):** call DBus `org.freedesktop.login1.Session.Lock()` for all of the user's sessions, wait `lockout_grace_minutes`, then call `org.freedesktop.login1.Session.Terminate()` for graphical sessions that remain active.
 - **Preserve tasks on:** lock the sessions and continue re-locking them while access remains blocked. Do not terminate the graphical session. Applications and unsaved work remain running; once access is restored, the user returns to the existing session.
 
 ### 9.3 Unlock / Session Resume
+
+- **Lock Now** persists `manual_locked` on the server, propagates and caches it on agents for offline enforcement, and remains active until explicitly cleared. Adding or removing daily time does not clear it.
+- **Unlock** clears only the manual lock. If the user is outside allowed hours or has exhausted the daily allowance, enforcement remains `Lock`.
+- `preserve_tasks_on_lock` controls how any lock is executed and is independent of why access is blocked.
 
 - When a new schedule window opens or a time adjustment grants more time:
   - If user is currently locked: the lock persists (the user can log back in).

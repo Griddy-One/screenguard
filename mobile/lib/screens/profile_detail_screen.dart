@@ -74,22 +74,15 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
     }
   }
 
-  Future<void> _unlock(TodayStatus today) async {
-    final minutes = unlockAdjustmentFor(today.adjustmentsMinutes);
-    if (minutes == 0) return;
+  Future<void> _unlock() async {
     final l = AppLocalizations.of(context);
     final ok = await _confirm(l.unlockConfirmTitle, l.unlockConfirmBody);
     if (!ok) return;
     setState(() => _unlocking = true);
     try {
-      await ref.read(apiClientProvider).post(
-        '/profiles/${widget.profileId}/adjustments',
-        {
-          'target_date': today.date,
-          'adjustment_minutes': minutes,
-          'reason': 'unlock',
-        },
-      );
+      await ref
+          .read(apiClientProvider)
+          .post('/profiles/${widget.profileId}/unlock');
       _refresh();
       if (mounted) _snack(AppLocalizations.of(context).screenTimeUnlocked);
     } on UnauthorizedException {
@@ -392,9 +385,11 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
           error: (e, _) => Text('Error: $e'),
           data: (status) {
             final today = status.today;
-            final isLocked = today.enforce == 'lock';
-            final hasLimit = today.limitMinutes != null;
-            final canUnlock = unlockAdjustmentFor(today.adjustmentsMinutes) > 0;
+            final effectiveAllowance = today.effectiveAllowanceMinutes;
+            final displayRemaining = today.displayRemainingMinutes;
+            final hasLimit = effectiveAllowance != null;
+            final canUnlock = today.canUnlock;
+            final lockStatus = today.displayLockState;
 
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -408,29 +403,32 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            isLocked
-                                ? l.locked
-                                : hasLimit
-                                    ? formatMinutes(today.remainingMinutes)
-                                    : l.noLimit,
+                            hasLimit
+                                ? formatMinutes(displayRemaining!)
+                                : l.noLimit,
                             style: Theme.of(context)
                                 .textTheme
                                 .displaySmall
                                 ?.copyWith(
-                                  color: isLocked
+                                  color: displayRemaining == 0 && hasLimit
                                       ? cs.error
-                                      : today.remainingMinutes < 15 && hasLimit
+                                      : hasLimit && displayRemaining! < 15
                                           ? Colors.orange
                                           : cs.primary,
                                   fontWeight: FontWeight.bold,
                                 ),
                           ),
+                          if (hasLimit)
+                            Text(
+                              l.remainingToday,
+                              style: TextStyle(color: cs.onSurfaceVariant),
+                            ),
                           const SizedBox(height: 4),
                           Text(
                             hasLimit
                                 ? l.usedOfLimit(
                                     formatMinutes(today.usedMinutes),
-                                    formatMinutes(today.limitMinutes!),
+                                    formatMinutes(effectiveAllowance),
                                   )
                                 : l.usedOf(formatMinutes(today.usedMinutes)),
                             style: TextStyle(color: cs.onSurfaceVariant),
@@ -445,6 +443,17 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
                                     ? Colors.green
                                     : cs.error,
                                 fontSize: 12,
+                              ),
+                            ),
+                          if (lockStatus != null)
+                            Text(
+                              lockStatus == TodayLockState.manuallyLocked
+                                  ? l.manuallyLocked
+                                  : l.locked,
+                              style: TextStyle(
+                                color: cs.error,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
                         ],
@@ -529,9 +538,7 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: canUnlock && !_unlocking
-                            ? () => _unlock(today)
-                            : null,
+                        onPressed: canUnlock && !_unlocking ? _unlock : null,
                         icon: _unlocking
                             ? const SizedBox(
                                 height: 14,

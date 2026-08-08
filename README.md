@@ -127,7 +127,7 @@ Each profile has two locking modes. The setting defaults to **off**, preserving 
 - **Default (preserve tasks off):** when access is blocked, ScreenGuard locks the login session and terminates the graphical session after the configured grace period.
 - **Preserve tasks on:** when access is blocked, ScreenGuard locks and continues re-locking the login session without terminating it. Applications and unsaved work remain running. Once access is restored, the user returns to the existing session.
 
-In both modes, **Lock now** zeroes the user's remaining allowance. The preserve-tasks setting changes only what happens to the graphical session while access remains blocked.
+In both modes, **Lock now** sets a persistent manual lock without changing the user's remaining allowance. **Unlock** clears only that manual lock; schedule and daily-limit restrictions still apply. The preserve-tasks setting changes only what happens to the graphical session while access remains blocked.
 
 ## Configuration
 

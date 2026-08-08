@@ -23,6 +23,7 @@ pub fn open(path: &str) -> Result<DbPool> {
     migrate_v2(&conn)?;
     migrate_v3(&conn)?;
     migrate_v4(&conn)?;
+    migrate_v5(&conn)?;
     Ok(pool)
 }
 
@@ -98,6 +99,20 @@ fn migrate_v4(conn: &rusqlite::Connection) -> Result<()> {
     )?;
     conn.execute("PRAGMA user_version = 4", [])?;
     tracing::info!("DB migration v4 applied (preserve tasks on lock)");
+    Ok(())
+}
+
+fn migrate_v5(conn: &rusqlite::Connection) -> Result<()> {
+    let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if v >= 5 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE enforcement_settings
+         ADD COLUMN manual_locked INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    conn.execute("PRAGMA user_version = 5", [])?;
+    tracing::info!("DB migration v5 applied (persistent manual lock)");
     Ok(())
 }
 
@@ -289,6 +304,7 @@ pub struct TimeAdjustment {
 pub struct EnforcementSettings {
     pub lockout_grace_minutes: i32,
     pub preserve_tasks_on_lock: bool,
+    pub manual_locked: bool,
     pub warning_thresholds: Vec<i32>,
 }
 
@@ -843,16 +859,17 @@ pub fn create_adjustment(
 
 pub fn get_enforcement_settings(pool: &DbPool, profile_id: Uuid) -> Result<EnforcementSettings> {
     let conn = pool.get()?;
-    let (grace, thresholds_str, preserve_tasks): (i32, String, bool) = conn.query_row(
-        "SELECT lockout_grace_minutes, warning_thresholds, preserve_tasks_on_lock
+    let (grace, thresholds_str, preserve_tasks, manual_locked): (i32, String, bool, bool) = conn.query_row(
+        "SELECT lockout_grace_minutes, warning_thresholds, preserve_tasks_on_lock, manual_locked
          FROM enforcement_settings WHERE profile_id=?1",
         params![profile_id.to_string()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).unwrap_or((5, "15,5,1".to_string(), false));
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap_or((5, "15,5,1".to_string(), false, false));
     let thresholds = thresholds_str.split(',').filter_map(|s| s.trim().parse().ok()).collect();
     Ok(EnforcementSettings {
         lockout_grace_minutes: grace,
         preserve_tasks_on_lock: preserve_tasks,
+        manual_locked,
         warning_thresholds: thresholds,
     })
 }
@@ -862,6 +879,15 @@ pub fn set_preserve_tasks_on_lock(pool: &DbPool, profile_id: Uuid, preserve: boo
     conn.execute(
         "UPDATE enforcement_settings SET preserve_tasks_on_lock=?1 WHERE profile_id=?2",
         params![preserve, profile_id.to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn set_manual_locked(pool: &DbPool, profile_id: Uuid, manual_locked: bool) -> Result<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE enforcement_settings SET manual_locked=?1 WHERE profile_id=?2",
+        params![manual_locked, profile_id.to_string()],
     )?;
     Ok(())
 }
@@ -1026,9 +1052,15 @@ mod tests {
         pool
     }
 
-    fn test_pool() -> DbPool {
+    fn test_pool_before_v5() -> DbPool {
         let pool = test_pool_before_v4();
         migrate_v4(&pool.get().unwrap()).unwrap();
+        pool
+    }
+
+    fn test_pool() -> DbPool {
+        let pool = test_pool_before_v5();
+        migrate_v5(&pool.get().unwrap()).unwrap();
         pool
     }
 
@@ -1038,6 +1070,14 @@ mod tests {
         let profile = create_profile(&pool, "Test profile").unwrap();
 
         assert!(!get_enforcement_settings(&pool, profile.id).unwrap().preserve_tasks_on_lock);
+    }
+
+    #[test]
+    fn new_profiles_default_manual_lock_to_false() {
+        let pool = test_pool();
+        let profile = create_profile(&pool, "Test profile").unwrap();
+
+        assert!(!get_enforcement_settings(&pool, profile.id).unwrap().manual_locked);
     }
 
     #[test]
@@ -1055,9 +1095,30 @@ mod tests {
             params![id.to_string()],
         ).unwrap();
         migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
         drop(conn);
 
         assert!(!get_enforcement_settings(&pool, id).unwrap().preserve_tasks_on_lock);
+    }
+
+    #[test]
+    fn migration_defaults_existing_profiles_manual_lock_to_false() {
+        let pool = test_pool_before_v5();
+        let id = Uuid::new_v4();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO user_profiles (id, display_name, created_at, updated_at, language)
+             VALUES (?1, 'Existing profile', 1, 1, 'en')",
+            params![id.to_string()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO enforcement_settings (profile_id) VALUES (?1)",
+            params![id.to_string()],
+        ).unwrap();
+        migrate_v5(&conn).unwrap();
+        drop(conn);
+
+        assert!(!get_enforcement_settings(&pool, id).unwrap().manual_locked);
     }
 
     #[test]
@@ -1070,6 +1131,64 @@ mod tests {
 
         set_preserve_tasks_on_lock(&pool, profile.id, false).unwrap();
         assert!(!get_enforcement_settings(&pool, profile.id).unwrap().preserve_tasks_on_lock);
+    }
+
+    #[test]
+    fn stores_and_retrieves_manual_lock_setting() {
+        let pool = test_pool();
+        let profile = create_profile(&pool, "Test profile").unwrap();
+
+        set_manual_locked(&pool, profile.id, true).unwrap();
+        assert!(get_enforcement_settings(&pool, profile.id).unwrap().manual_locked);
+
+        set_manual_locked(&pool, profile.id, false).unwrap();
+        assert!(!get_enforcement_settings(&pool, profile.id).unwrap().manual_locked);
+    }
+
+    #[test]
+    fn manual_lock_survives_server_database_reopen() {
+        let path = std::env::temp_dir().join(format!("screenguard-server-{}.db", Uuid::new_v4()));
+        let profile_id;
+        {
+            let pool = open(path.to_str().unwrap()).unwrap();
+            let profile = create_profile(&pool, "Persistent profile").unwrap();
+            profile_id = profile.id;
+            set_manual_locked(&pool, profile_id, true).unwrap();
+        }
+
+        let reopened = open(path.to_str().unwrap()).unwrap();
+        assert!(get_enforcement_settings(&reopened, profile_id).unwrap().manual_locked);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn lock_now_state_is_idempotent_and_does_not_modify_adjustments() {
+        let pool = test_pool();
+        let profile = create_profile(&pool, "Test profile").unwrap();
+        create_adjustment(&pool, profile.id, "2026-08-08", 30, Some("bonus"), None).unwrap();
+
+        set_manual_locked(&pool, profile.id, true).unwrap();
+        set_manual_locked(&pool, profile.id, true).unwrap();
+
+        assert!(get_enforcement_settings(&pool, profile.id).unwrap().manual_locked);
+        assert_eq!(sum_adjustments_for_date(&pool, profile.id, "2026-08-08").unwrap(), 30);
+    }
+
+    #[test]
+    fn unlock_state_is_idempotent_and_does_not_modify_adjustments() {
+        let pool = test_pool();
+        let profile = create_profile(&pool, "Test profile").unwrap();
+        create_adjustment(&pool, profile.id, "2026-08-08", -15, Some("existing"), None).unwrap();
+        set_manual_locked(&pool, profile.id, true).unwrap();
+
+        set_manual_locked(&pool, profile.id, false).unwrap();
+        set_manual_locked(&pool, profile.id, false).unwrap();
+
+        assert!(!get_enforcement_settings(&pool, profile.id).unwrap().manual_locked);
+        assert_eq!(sum_adjustments_for_date(&pool, profile.id, "2026-08-08").unwrap(), -15);
     }
 
     #[test]
@@ -1096,5 +1215,31 @@ mod tests {
 
         assert_eq!(config.users.len(), 1);
         assert!(config.users[0].preserve_tasks_on_lock);
+    }
+
+    #[test]
+    fn config_propagation_includes_manual_lock_setting() {
+        let pool = test_pool();
+        let profile = create_profile(&pool, "Test profile").unwrap();
+        set_manual_locked(&pool, profile.id, true).unwrap();
+        let agent_id = Uuid::new_v4();
+        pool.get().unwrap().execute(
+            "INSERT INTO agents
+             (id, machine_id, display_name, hostname, timezone, status, agent_version, created_at)
+             VALUES (?1, 'manual-machine', 'host', 'host', 'UTC', 'paired', 'test', 1)",
+            params![agent_id.to_string()],
+        ).unwrap();
+        upsert_agent_users(&pool, agent_id, &[LocalUser {
+            local_uid: 1000,
+            username: "test".to_string(),
+            display_name: "Test User".to_string(),
+        }]).unwrap();
+        let agent_user = get_agent_user(&pool, agent_id, 1000).unwrap().unwrap();
+        update_agent_user(&pool, agent_user.id, Some(profile.id), Some("managed")).unwrap();
+
+        let config = crate::remaining::build_config_push(&pool, agent_id, 2).unwrap();
+
+        assert_eq!(config.users.len(), 1);
+        assert!(config.users[0].manual_locked);
     }
 }

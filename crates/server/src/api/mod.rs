@@ -46,6 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Adjustments
         .route("/profiles/{id}/adjustments", get(profiles::list_adjustments).post(profiles::create_adjustment))
         .route("/profiles/{id}/lock-now", post(profiles::lock_now))
+        .route("/profiles/{id}/unlock", post(profiles::unlock))
         .route("/profiles/{id}/notify", post(profiles::notify_profile))
         // Usage & dashboard
         .route("/profiles/{id}/usage", get(usage::get_usage))

@@ -33,6 +33,12 @@ fn offline_evaluate(uid: u32, db: &Db) -> Result<EnforceAction> {
     let now = Local::now();
     let today = now.date_naive();
     let weekday = today.weekday().num_days_from_monday() as u8;
+    let enforcement = db.get_cached_enforcement(uid)?;
+
+    if enforcement.manual_locked {
+        tracing::info!("uid={uid}: manually locked (offline evaluation)");
+        return Ok(EnforceAction::Lock);
+    }
 
     // 1. Check schedule windows.
     let schedules = db.get_cached_schedules(uid)?;
@@ -83,7 +89,6 @@ fn offline_evaluate(uid: u32, db: &Db) -> Result<EnforceAction> {
     }
 
     // 4. Warning thresholds — warn if remaining is at or below any configured threshold.
-    let enforcement = db.get_cached_enforcement(uid)?;
     if enforcement.warning_thresholds.iter().any(|&t| remaining <= t as i32) {
         return Ok(EnforceAction::Warn);
     }
@@ -162,7 +167,27 @@ pub async fn execute_lock(uid: u32, db: &Arc<Mutex<Db>>) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_behavior, LockBehavior};
+    use super::{lock_behavior, offline_evaluate, LockBehavior};
+    use crate::db::Db;
+    use common::models::{EnforceAction, UserConfig, UserStatus};
+    use uuid::Uuid;
+
+    fn config(manual_locked: bool) -> UserConfig {
+        UserConfig {
+            local_uid: 1000,
+            profile_id: Uuid::new_v4(),
+            status: UserStatus::Managed,
+            schedules: vec![],
+            daily_limits: vec![],
+            adjustments_today: 0,
+            adjustment_message: None,
+            lockout_grace_minutes: 5,
+            preserve_tasks_on_lock: false,
+            manual_locked,
+            warning_thresholds_minutes: vec![15, 5, 1],
+            language: "en".to_string(),
+        }
+    }
 
     #[test]
     fn preserve_off_terminates_after_grace() {
@@ -172,6 +197,22 @@ mod tests {
     #[test]
     fn preserve_on_keeps_session_armed_for_relocking() {
         assert_eq!(lock_behavior(true), LockBehavior::PreserveAndRelock);
+    }
+
+    #[test]
+    fn cached_manual_lock_takes_precedence_offline() {
+        let db = Db::open(Some(":memory:")).unwrap();
+        db.apply_config_push(&[config(true)]).unwrap();
+
+        assert_eq!(offline_evaluate(1000, &db).unwrap(), EnforceAction::Lock);
+    }
+
+    #[test]
+    fn cleared_manual_lock_returns_to_normal_offline_enforcement() {
+        let db = Db::open(Some(":memory:")).unwrap();
+        db.apply_config_push(&[config(false)]).unwrap();
+
+        assert_eq!(offline_evaluate(1000, &db).unwrap(), EnforceAction::Allow);
     }
 }
 

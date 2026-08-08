@@ -5,6 +5,7 @@ class ProfileSummary {
   final int? limitMinutes;
   final int usedMinutes;
   final String enforce;
+  final bool manualLocked;
   final int agentsOnline;
   final int agentsTotal;
 
@@ -15,6 +16,7 @@ class ProfileSummary {
     this.limitMinutes,
     required this.usedMinutes,
     required this.enforce,
+    required this.manualLocked,
     required this.agentsOnline,
     required this.agentsTotal,
   });
@@ -26,6 +28,7 @@ class ProfileSummary {
         limitMinutes: j['limit_minutes'] as int?,
         usedMinutes: (j['used_minutes'] as int?) ?? 0,
         enforce: (j['enforce'] as String?) ?? 'allow',
+        manualLocked: (j['manual_locked'] as bool?) ?? false,
         agentsOnline: (j['agents_online'] as int?) ?? 0,
         agentsTotal: (j['agents_total'] as int?) ?? 0,
       );
@@ -36,6 +39,7 @@ class Profile {
   final String displayName;
   final String language;
   final bool preserveTasksOnLock;
+  final bool manualLocked;
   final List<Schedule> schedules;
   final List<DailyLimit> dailyLimits;
   final List<AgentUser> agentUsers;
@@ -45,6 +49,7 @@ class Profile {
     required this.displayName,
     required this.language,
     required this.preserveTasksOnLock,
+    required this.manualLocked,
     required this.schedules,
     required this.dailyLimits,
     required this.agentUsers,
@@ -57,6 +62,7 @@ class Profile {
       displayName: p['display_name'] as String,
       language: (p['language'] as String?) ?? 'en',
       preserveTasksOnLock: (j['preserve_tasks_on_lock'] as bool?) ?? false,
+      manualLocked: (j['manual_locked'] as bool?) ?? false,
       schedules: ((j['schedules'] as List?) ?? [])
           .map((s) => Schedule.fromJson(s as Map<String, dynamic>))
           .toList(),
@@ -184,6 +190,7 @@ class TodayStatus {
   final int adjustmentsMinutes;
   final int remainingMinutes;
   final String enforce;
+  final bool manualLocked;
 
   const TodayStatus({
     required this.date,
@@ -192,6 +199,7 @@ class TodayStatus {
     required this.adjustmentsMinutes,
     required this.remainingMinutes,
     required this.enforce,
+    required this.manualLocked,
   });
 
   factory TodayStatus.fromJson(Map<String, dynamic> j) => TodayStatus(
@@ -201,11 +209,32 @@ class TodayStatus {
         adjustmentsMinutes: (j['adjustments_minutes'] as int?) ?? 0,
         remainingMinutes: (j['remaining_minutes'] as int?) ?? 0,
         enforce: (j['enforce'] as String?) ?? 'allow',
+        manualLocked: (j['manual_locked'] as bool?) ?? false,
       );
+
+  bool get canUnlock => manualLocked;
+
+  int? get effectiveAllowanceMinutes {
+    if (limitMinutes == null) return null;
+    final allowance = limitMinutes! + adjustmentsMinutes;
+    return allowance < 0 ? 0 : allowance;
+  }
+
+  int? get displayRemainingMinutes {
+    final allowance = effectiveAllowanceMinutes;
+    if (allowance == null) return null;
+    final remaining = allowance - usedMinutes;
+    return remaining < 0 ? 0 : remaining;
+  }
+
+  TodayLockState? get displayLockState {
+    if (manualLocked) return TodayLockState.manuallyLocked;
+    if (enforce == 'lock') return TodayLockState.locked;
+    return null;
+  }
 }
 
-int unlockAdjustmentFor(int adjustmentsMinutes) =>
-    adjustmentsMinutes < 0 ? -adjustmentsMinutes : 0;
+enum TodayLockState { manuallyLocked, locked }
 
 class AgentOnlineStatus {
   final String agentId;

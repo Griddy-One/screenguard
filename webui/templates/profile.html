@@ -62,7 +62,7 @@
         {% set pct = none %}
       {% endif %}
 
-      {% set can_unlock = ts.adjustments_minutes is not none and ts.adjustments_minutes < 0 %}
+      {% set can_unlock = manual_locked %}
       {# bar state #}
       {% if eff_total is none %}
         {% set bar_type = 'nolimit' %}
@@ -91,6 +91,11 @@
               {{ ts.remaining_minutes | fmt_mins }}
             </div>
             <div style="font-size:.8rem;color:var(--t2);margin-bottom:14px">{{ t('profile.remaining_today') }}</div>
+            {% if manual_locked %}
+              <div class="text-danger" style="font-size:.8rem;font-weight:600;margin-bottom:10px">
+                {{ t('profile.manually_locked') }}
+              </div>
+            {% endif %}
             {# status bar #}
             {% if bar_type == 'nolimit' %}
               <div style="height:22px;border-radius:var(--r2);background:var(--ok);margin-bottom:7px"></div>
@@ -168,10 +173,7 @@
                   {{ t('profile.btn_lock') }}
                 </button>
               </form>
-              <form method="post" action="{{ url_for('add_adjustment', profile_id=profile.id) }}">
-                <input type="hidden" name="target_date" value="{{ today }}">
-                <input type="hidden" name="minutes" value="{{ ((ts.adjustments_minutes or 0) * -1) | int }}">
-                <input type="hidden" name="reason" value="unlock">
+              <form method="post" action="{{ url_for('unlock_profile', profile_id=profile.id) }}">
                 <button type="submit"
                         class="btn w-100 d-flex align-items-center justify-content-center gap-2"
                         style="font-size:13px;padding:9px 12px;

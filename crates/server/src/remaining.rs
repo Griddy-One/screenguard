@@ -9,6 +9,21 @@ use uuid::Uuid;
 
 use crate::db::{self, DbPool};
 
+fn enforcement_action(
+    manual_locked: bool,
+    outside_schedule: bool,
+    remaining: i32,
+    warning_thresholds: &[i32],
+) -> EnforceAction {
+    if manual_locked || outside_schedule || remaining <= 0 {
+        EnforceAction::Lock
+    } else if warning_thresholds.iter().any(|&t| remaining <= t) {
+        EnforceAction::Warn
+    } else {
+        EnforceAction::Allow
+    }
+}
+
 /// Calculate remaining time for every managed agent_user linked to this agent,
 /// update daily_usage with the new active seconds, and return a list of
 /// RemainingEntry values to send back in a remaining_update message.
@@ -64,6 +79,7 @@ pub fn calculate_remaining_for_agent(
 
         // 4. Adjustments today.
         let adjustments = db::sum_adjustments_for_date(pool, profile_id, &today_str)?;
+        let enforcement = db::get_enforcement_settings(pool, profile_id)?;
 
         // 5. Remaining from limit.
         let mut remaining = (limit_minutes + adjustments - used_minutes).max(0);
@@ -89,7 +105,8 @@ pub fn calculate_remaining_for_agent(
         }).collect();
         let (window_ends_at, next_window) = check_schedule_windows(&converted_schedules, weekday, now_time);
 
-        if window_ends_at.is_none() && !converted_schedules.is_empty() {
+        let outside_schedule = window_ends_at.is_none() && !converted_schedules.is_empty();
+        if outside_schedule {
             // Outside all windows — lock regardless of time remaining.
             entries.push(RemainingEntry {
                 local_uid: *local_uid,
@@ -99,7 +116,12 @@ pub fn calculate_remaining_for_agent(
                 adjustments_today_minutes: adjustments,
                 current_window_ends_at: None,
                 next_window_starts_at: next_window,
-                enforce: EnforceAction::Lock,
+                enforce: enforcement_action(
+                    enforcement.manual_locked,
+                    true,
+                    remaining,
+                    &enforcement.warning_thresholds,
+                ),
             });
             continue;
         }
@@ -112,14 +134,12 @@ pub fn calculate_remaining_for_agent(
         }
 
         // 7. Determine enforce action.
-        let enforcement = db::get_enforcement_settings(pool, profile_id)?;
-        let enforce = if remaining <= 0 {
-            EnforceAction::Lock
-        } else if enforcement.warning_thresholds.iter().any(|&t| remaining <= t) {
-            EnforceAction::Warn
-        } else {
-            EnforceAction::Allow
-        };
+        let enforce = enforcement_action(
+            enforcement.manual_locked,
+            false,
+            remaining,
+            &enforcement.warning_thresholds,
+        );
 
         entries.push(RemainingEntry {
             local_uid: *local_uid,
@@ -184,6 +204,7 @@ pub fn build_config_push(pool: &DbPool, agent_id: Uuid, config_version: i64) -> 
             adjustment_message,
             lockout_grace_minutes: enforcement.lockout_grace_minutes as u32,
             preserve_tasks_on_lock: enforcement.preserve_tasks_on_lock,
+            manual_locked: enforcement.manual_locked,
             warning_thresholds_minutes: enforcement.warning_thresholds.iter().map(|&t| t as u32).collect(),
             language,
         });
@@ -218,6 +239,81 @@ fn today_in_timezone(tz: &str) -> NaiveDate {
 fn current_time_in_timezone(tz: &str) -> NaiveTime {
     let tz: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::UTC);
     chrono::Utc::now().with_timezone(&tz).time()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calculate_remaining_for_agent, enforcement_action};
+    use common::models::{EnforceAction, LocalUser};
+    use rusqlite::params;
+    use uuid::Uuid;
+
+    const THRESHOLDS: &[i32] = &[15, 5, 1];
+
+    #[test]
+    fn manual_lock_overrides_available_time() {
+        assert_eq!(enforcement_action(true, false, 45, THRESHOLDS), EnforceAction::Lock);
+    }
+
+    #[test]
+    fn clearing_manual_lock_restores_normal_available_time_action() {
+        assert_eq!(enforcement_action(false, false, 45, THRESHOLDS), EnforceAction::Allow);
+        assert_eq!(enforcement_action(false, false, 10, THRESHOLDS), EnforceAction::Warn);
+    }
+
+    #[test]
+    fn exhausted_allowance_remains_locked_after_manual_lock_is_cleared() {
+        assert_eq!(enforcement_action(true, false, 0, THRESHOLDS), EnforceAction::Lock);
+        assert_eq!(enforcement_action(false, false, 0, THRESHOLDS), EnforceAction::Lock);
+    }
+
+    #[test]
+    fn outside_schedule_remains_locked_after_manual_lock_is_cleared() {
+        assert_eq!(enforcement_action(true, true, 45, THRESHOLDS), EnforceAction::Lock);
+        assert_eq!(enforcement_action(false, true, 45, THRESHOLDS), EnforceAction::Lock);
+    }
+
+    #[test]
+    fn adjustments_do_not_override_manual_lock() {
+        assert_eq!(enforcement_action(true, false, 60, THRESHOLDS), EnforceAction::Lock);
+        assert_eq!(enforcement_action(true, false, 30, THRESHOLDS), EnforceAction::Lock);
+    }
+
+    #[test]
+    fn unlimited_profile_can_be_manually_locked_without_changing_limit_semantics() {
+        assert_eq!(enforcement_action(true, false, 1440, THRESHOLDS), EnforceAction::Lock);
+        assert_eq!(enforcement_action(false, false, 1440, THRESHOLDS), EnforceAction::Allow);
+    }
+
+    #[test]
+    fn unlimited_profile_retains_no_limit_representation_through_lock_and_unlock() {
+        let pool = crate::db::open(":memory:").unwrap();
+        let profile = crate::db::create_profile(&pool, "Unlimited").unwrap();
+        let agent_id = Uuid::new_v4();
+        pool.get().unwrap().execute(
+            "INSERT INTO agents
+             (id, machine_id, display_name, hostname, timezone, status, agent_version, created_at)
+             VALUES (?1, 'unlimited-machine', 'host', 'host', 'UTC', 'paired', 'test', 1)",
+            params![agent_id.to_string()],
+        ).unwrap();
+        crate::db::upsert_agent_users(&pool, agent_id, &[LocalUser {
+            local_uid: 1000,
+            username: "test".to_string(),
+            display_name: "Test User".to_string(),
+        }]).unwrap();
+        let agent_user = crate::db::get_agent_user(&pool, agent_id, 1000).unwrap().unwrap();
+        crate::db::update_agent_user(&pool, agent_user.id, Some(profile.id), Some("managed")).unwrap();
+
+        crate::db::set_manual_locked(&pool, profile.id, true).unwrap();
+        let locked = calculate_remaining_for_agent(&pool, agent_id, "UTC", "UTC", &[(1000, 0)]).unwrap();
+        assert_eq!(locked[0].limit_today_minutes, None);
+        assert_eq!(locked[0].enforce, EnforceAction::Lock);
+
+        crate::db::set_manual_locked(&pool, profile.id, false).unwrap();
+        let unlocked = calculate_remaining_for_agent(&pool, agent_id, "UTC", "UTC", &[(1000, 0)]).unwrap();
+        assert_eq!(unlocked[0].limit_today_minutes, None);
+        assert_eq!(unlocked[0].enforce, EnforceAction::Allow);
+    }
 }
 
 /// Returns (current_window_end, next_window_start) given schedules and current time.

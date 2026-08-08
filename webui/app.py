@@ -441,6 +441,7 @@ def profile_detail(profile_id):
                            agent_users=data.get("agent_users", []),
                            status=status,
                            preserve_tasks_on_lock=data.get("preserve_tasks_on_lock", False),
+                           manual_locked=data.get("manual_locked", False),
                            week_bars=week_bars,
                            week_max=chart_max,
                            week_offset=week_offset,
@@ -565,6 +566,15 @@ def notify_profile(profile_id):
 def lock_now(profile_id):
     r = api("POST", f"/profiles/{profile_id}/lock-now")
     flash(t("flash.locked") if (r and r.ok) else t("flash.lock_failed"),
+          "success" if (r and r.ok) else "danger")
+    return redirect(url_for("profile_detail", profile_id=profile_id))
+
+
+@app.route("/profiles/<profile_id>/unlock", methods=["POST"])
+@require_login
+def unlock_profile(profile_id):
+    r = api("POST", f"/profiles/{profile_id}/unlock")
+    flash(t("flash.unlocked") if (r and r.ok) else t("flash.unlock_failed"),
           "success" if (r and r.ok) else "danger")
     return redirect(url_for("profile_detail", profile_id=profile_id))
 

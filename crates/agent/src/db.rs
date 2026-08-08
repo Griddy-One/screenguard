@@ -39,6 +39,9 @@ impl Db {
         let _ = self.conn.execute_batch(
             "ALTER TABLE cached_enforcement ADD COLUMN preserve_tasks_on_lock INTEGER NOT NULL DEFAULT 0",
         );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE cached_enforcement ADD COLUMN manual_locked INTEGER NOT NULL DEFAULT 0",
+        );
         Ok(())
     }
 
@@ -93,6 +96,7 @@ impl Db {
                 lockout_grace_minutes   INTEGER NOT NULL DEFAULT 5,
                 warning_thresholds      TEXT NOT NULL DEFAULT '15,5,1',
                 preserve_tasks_on_lock  INTEGER NOT NULL DEFAULT 0,
+                manual_locked           INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (local_uid)
             );
 
@@ -264,8 +268,8 @@ impl Db {
 
             tx.execute(
                 "INSERT OR REPLACE INTO cached_enforcement
-                 (local_uid, lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (local_uid, lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock, manual_locked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     u.local_uid,
                     u.lockout_grace_minutes,
@@ -276,6 +280,7 @@ impl Db {
                         .join(","),
                     &u.language,
                     u.preserve_tasks_on_lock,
+                    u.manual_locked,
                 ],
             )?;
         }
@@ -495,6 +500,7 @@ pub struct CachedEnforcement {
     pub warning_thresholds: Vec<u32>,
     pub language: String,
     pub preserve_tasks_on_lock: bool,
+    pub manual_locked: bool,
 }
 
 impl Default for CachedEnforcement {
@@ -504,6 +510,7 @@ impl Default for CachedEnforcement {
             warning_thresholds: vec![15, 5, 1],
             language: "en".to_string(),
             preserve_tasks_on_lock: false,
+            manual_locked: false,
         }
     }
 }
@@ -550,11 +557,11 @@ impl Db {
     }
 
     pub fn get_cached_enforcement(&self, uid: u32) -> Result<CachedEnforcement> {
-        let (grace, thresholds_str, language, preserve_tasks): (u32, String, String, bool) = self.conn.query_row(
-            "SELECT lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock FROM cached_enforcement WHERE local_uid = ?1",
+        let (grace, thresholds_str, language, preserve_tasks, manual_locked): (u32, String, String, bool, bool) = self.conn.query_row(
+            "SELECT lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock, manual_locked FROM cached_enforcement WHERE local_uid = ?1",
             params![uid],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).unwrap_or((5, "15,5,1".to_string(), "en".to_string(), false));
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap_or((5, "15,5,1".to_string(), "en".to_string(), false, false));
 
         let thresholds = thresholds_str
             .split(',')
@@ -566,6 +573,7 @@ impl Db {
             warning_thresholds: thresholds,
             language,
             preserve_tasks_on_lock: preserve_tasks,
+            manual_locked,
         })
     }
 }
@@ -577,7 +585,7 @@ mod tests {
     use rusqlite::Connection;
     use uuid::Uuid;
 
-    fn user_config(uid: u32, preserve_tasks_on_lock: bool) -> UserConfig {
+    fn user_config(uid: u32, preserve_tasks_on_lock: bool, manual_locked: bool) -> UserConfig {
         UserConfig {
             local_uid: uid,
             profile_id: Uuid::new_v4(),
@@ -588,6 +596,7 @@ mod tests {
             adjustment_message: None,
             lockout_grace_minutes: 5,
             preserve_tasks_on_lock,
+            manual_locked,
             warning_thresholds_minutes: vec![15, 5, 1],
             language: "en".to_string(),
         }
@@ -622,10 +631,60 @@ mod tests {
     fn config_push_caches_preserve_tasks_setting() {
         let db = Db::open(Some(":memory:")).unwrap();
 
-        db.apply_config_push(&[user_config(1000, true)]).unwrap();
+        db.apply_config_push(&[user_config(1000, true, false)]).unwrap();
         assert!(db.get_cached_enforcement(1000).unwrap().preserve_tasks_on_lock);
 
-        db.apply_config_push(&[user_config(1000, false)]).unwrap();
+        db.apply_config_push(&[user_config(1000, false, false)]).unwrap();
         assert!(!db.get_cached_enforcement(1000).unwrap().preserve_tasks_on_lock);
+    }
+
+    #[test]
+    fn cached_enforcement_defaults_manual_lock_to_false() {
+        let db = Db::open(Some(":memory:")).unwrap();
+
+        assert!(!db.get_cached_enforcement(1000).unwrap().manual_locked);
+    }
+
+    #[test]
+    fn migration_defaults_existing_cached_manual_lock_to_false() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cached_enforcement (
+                local_uid INTEGER PRIMARY KEY,
+                lockout_grace_minutes INTEGER NOT NULL DEFAULT 5,
+                warning_thresholds TEXT NOT NULL DEFAULT '15,5,1'
+             );
+             INSERT INTO cached_enforcement (local_uid) VALUES (1000);",
+        ).unwrap();
+        let db = Db { conn };
+
+        db.migrate().unwrap();
+
+        assert!(!db.get_cached_enforcement(1000).unwrap().manual_locked);
+    }
+
+    #[test]
+    fn config_push_caches_manual_lock_setting() {
+        let db = Db::open(Some(":memory:")).unwrap();
+
+        db.apply_config_push(&[user_config(1000, false, true)]).unwrap();
+        assert!(db.get_cached_enforcement(1000).unwrap().manual_locked);
+
+        db.apply_config_push(&[user_config(1000, false, false)]).unwrap();
+        assert!(!db.get_cached_enforcement(1000).unwrap().manual_locked);
+    }
+
+    #[test]
+    fn cached_manual_lock_survives_agent_database_reopen() {
+        let path = std::env::temp_dir().join(format!("screenguard-agent-{}.db", Uuid::new_v4()));
+        {
+            let db = Db::open(path.to_str()).unwrap();
+            db.apply_config_push(&[user_config(1000, false, true)]).unwrap();
+        }
+
+        let reopened = Db::open(path.to_str()).unwrap();
+        assert!(reopened.get_cached_enforcement(1000).unwrap().manual_locked);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 }

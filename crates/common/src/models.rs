@@ -27,6 +27,8 @@ pub struct UserConfig {
     pub lockout_grace_minutes: u32,
     #[serde(default)]
     pub preserve_tasks_on_lock: bool,
+    #[serde(default)]
+    pub manual_locked: bool,
     pub warning_thresholds_minutes: Vec<u32>,
     #[serde(default = "default_lang")]
     pub language: String,
@@ -94,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn user_config_missing_preserve_tasks_defaults_to_false() {
+    fn user_config_missing_optional_lock_fields_defaults_to_false() {
         let json = r#"{
             "local_uid": 1000,
             "profile_id": "00000000-0000-0000-0000-000000000001",
@@ -110,6 +112,7 @@ mod tests {
         let config: UserConfig = serde_json::from_str(json).unwrap();
 
         assert!(!config.preserve_tasks_on_lock);
+        assert!(!config.manual_locked);
     }
 
     #[test]
@@ -127,18 +130,39 @@ mod tests {
         });
         let config: UserConfig = serde_json::from_value(value.clone()).unwrap();
         value["preserve_tasks_on_lock"] = serde_json::Value::Bool(false);
+        value["manual_locked"] = serde_json::Value::Bool(false);
         value["language"] = serde_json::Value::String("en".to_string());
 
         assert_eq!(serde_json::to_value(config).unwrap(), value);
     }
 
     #[test]
-    fn legacy_agent_ignores_preserve_tasks_field() {
+    fn legacy_agent_ignores_new_lock_fields() {
         let config: LegacyUserConfig = serde_json::from_value(serde_json::json!({
             "local_uid": 1000,
-            "preserve_tasks_on_lock": true
+            "preserve_tasks_on_lock": true,
+            "manual_locked": true
         })).unwrap();
 
         assert_eq!(config.local_uid, 1000);
+    }
+
+    #[test]
+    fn user_config_serializes_manual_lock_setting() {
+        let json = r#"{
+            "local_uid": 1000,
+            "profile_id": "00000000-0000-0000-0000-000000000001",
+            "status": "managed",
+            "schedules": [],
+            "daily_limits": [],
+            "adjustments_today": 0,
+            "adjustment_message": null,
+            "lockout_grace_minutes": 5,
+            "manual_locked": true,
+            "warning_thresholds_minutes": [15, 5, 1]
+        }"#;
+        let config: UserConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(serde_json::to_value(config).unwrap()["manual_locked"], true);
     }
 }

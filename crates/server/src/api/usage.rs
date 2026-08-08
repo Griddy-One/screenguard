@@ -78,6 +78,7 @@ pub async fn get_status(
     let used_secs = db::get_used_seconds_for_profile_today(&state.db, id, &today_str).map_err(internal)?;
     let limits = db::get_daily_limits(&state.db, id).map_err(internal)?;
     let adj = db::sum_adjustments_for_date(&state.db, id, &today_str).map_err(internal)?;
+    let enforcement = db::get_enforcement_settings(&state.db, id).map_err(internal)?;
     let limit_min = limits.iter().find(|l| l.day_of_week == dow).map(|l| l.allowed_minutes);
     let used_min = (used_secs / 60) as i32;
     // Use 1440 as the base when no explicit limit is set — matches enforcement logic.
@@ -107,7 +108,7 @@ pub async fn get_status(
         }));
     }
 
-    let enforce = if remaining <= 0 { "lock" } else { "allow" };
+    let enforce = if enforcement.manual_locked || remaining <= 0 { "lock" } else { "allow" };
 
     Ok(Json(serde_json::json!({
         "profile": {
@@ -121,6 +122,7 @@ pub async fn get_status(
                 "adjustments_minutes": adj,
                 "remaining_minutes": remaining,
                 "enforce": enforce,
+                "manual_locked": enforcement.manual_locked,
             },
             "agents": agents_out,
         }
@@ -143,6 +145,7 @@ pub async fn dashboard(
             .map_err(internal)?;
         let limits = db::get_daily_limits(&state.db, p.id).map_err(internal)?;
         let adj = db::sum_adjustments_for_date(&state.db, p.id, &today_str).map_err(internal)?;
+        let enforcement = db::get_enforcement_settings(&state.db, p.id).map_err(internal)?;
         let limit_min = limits.iter().find(|l| l.day_of_week == dow).map(|l| l.allowed_minutes);
         let used_min = (used_secs / 60) as i32;
         let remaining = limit_min.map(|l| (l + adj - used_min).max(0));
@@ -162,7 +165,8 @@ pub async fn dashboard(
             "remaining_minutes": remaining,
             "limit_minutes": limit_min,
             "used_minutes": used_min,
-            "enforce": if remaining.map(|r| r <= 0).unwrap_or(false) { "lock" } else { "allow" },
+            "enforce": if enforcement.manual_locked || remaining.map(|r| r <= 0).unwrap_or(false) { "lock" } else { "allow" },
+            "manual_locked": enforcement.manual_locked,
             "agents_online": agents_online,
             "agents_total": agents_total,
         }));

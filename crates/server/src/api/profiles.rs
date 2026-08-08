@@ -52,6 +52,7 @@ pub async fn get_profile(
         "daily_limits": limits,
         "agent_users": users,
         "preserve_tasks_on_lock": enforcement.preserve_tasks_on_lock,
+        "manual_locked": enforcement.manual_locked,
     })))
 }
 
@@ -60,11 +61,6 @@ pub struct PatchProfileBody {
     pub display_name: Option<String>,
     pub language: Option<String>,
     pub preserve_tasks_on_lock: Option<bool>,
-}
-
-fn lock_now_adjustment(limit: i32, adjustments: i32, used_minutes: i32) -> i32 {
-    let remaining = (limit + adjustments - used_minutes).max(0);
-    -remaining - adjustments
 }
 
 pub async fn patch_profile(
@@ -212,26 +208,11 @@ pub async fn lock_now(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     db::get_profile(&state.db, id).map_err(internal)?.ok_or_else(not_found)?;
-
-    let today = Local::now().date_naive().to_string();
-    let used_secs = db::get_used_seconds_for_profile_today(&state.db, id, &today)
-        .map_err(internal)?;
-    let limits = db::get_daily_limits(&state.db, id).map_err(internal)?;
-    let weekday = db::weekday_for_date(&today);
-    let limit = limits.iter().find(|l| l.day_of_week == weekday)
-        .map(|l| l.allowed_minutes)
-        .unwrap_or(1440);
-    let adj = db::sum_adjustments_for_date(&state.db, id, &today).map_err(internal)?;
-    let used_min = (used_secs / 60) as i32;
-    // Insert a negative adjustment to zero out remaining time.
-    let needed = lock_now_adjustment(limit, adj, used_min);
-    let adj_id = db::create_adjustment(&state.db, id, &today, needed, Some("lock_now"), None)
-        .map_err(internal)?;
+    db::set_manual_locked(&state.db, id, true).map_err(internal)?;
+    bump_and_propagate(&state, id).await.map_err(internal)?;
 
     // Send lock_now to all online agents with users linked to this profile.
     let agent_users = db::get_agent_users_for_profile(&state.db, id).map_err(internal)?;
-    let agent_ids: Vec<Uuid> = agent_users.iter().map(|u| u.agent_id).collect();
-
     for au in &agent_users {
         let msg = WssMessage::new(
             common::messages::MSG_LOCK_NOW,
@@ -240,8 +221,18 @@ pub async fn lock_now(
         state.send_to_agent_id(au.agent_id, msg).await;
     }
 
-    let _ = agent_ids;
-    Ok(Json(serde_json::json!({ "message": "Today's allowance zeroed out", "adjustment_id": adj_id })))
+    Ok(Json(serde_json::json!({ "message": "Profile manually locked", "manual_locked": true })))
+}
+
+pub async fn unlock(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    db::get_profile(&state.db, id).map_err(internal)?.ok_or_else(not_found)?;
+    db::set_manual_locked(&state.db, id, false).map_err(internal)?;
+    bump_and_propagate(&state, id).await.map_err(internal)?;
+
+    Ok(Json(serde_json::json!({ "message": "Manual lock cleared", "manual_locked": false })))
 }
 
 // ── notify ────────────────────────────────────────────────────────────────────
@@ -352,25 +343,12 @@ pub async fn bump_and_propagate(state: &AppState, profile_id: Uuid) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_now_adjustment, PatchProfileBody};
+    use super::PatchProfileBody;
 
     #[test]
     fn older_patch_body_leaves_preserve_tasks_unchanged() {
         let body: PatchProfileBody = serde_json::from_str(r#"{"display_name":"Renamed"}"#).unwrap();
 
         assert!(body.preserve_tasks_on_lock.is_none());
-    }
-
-    #[test]
-    fn lock_now_zeroes_allowance_for_both_lock_modes() {
-        let limit = 120;
-        let adjustments = 20;
-        let used = 30;
-
-        for _preserve_tasks_on_lock in [false, true] {
-            let added_adjustment = lock_now_adjustment(limit, adjustments, used);
-            let remaining = (limit + adjustments + added_adjustment - used).max(0);
-            assert_eq!(remaining, 0);
-        }
     }
 }

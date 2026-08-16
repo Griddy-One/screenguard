@@ -532,13 +532,37 @@ fn cinnamon_backend_applies(desktop: Option<&str>) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTarget {
+    Valid,
+    StaleOwnership,
+    Missing,
+}
+
+fn classify_session(
+    expected_uid: u32,
+    requested_sid: &str,
+    live_session: Option<(&str, u32)>,
+) -> SessionTarget {
+    let Some((live_sid, live_uid)) = live_session else {
+        return SessionTarget::Missing;
+    };
+    if requested_sid != live_sid || expected_uid != live_uid {
+        if requested_sid == live_sid {
+            return SessionTarget::StaleOwnership;
+        }
+        return SessionTarget::Missing;
+    }
+    SessionTarget::Valid
+}
+
 /// Lock all requested sessions, preferring a verified desktop-native backend.
-pub async fn lock_sessions(session_ids: &[String]) -> Result<()> {
+pub async fn lock_sessions(expected_uid: u32, session_ids: &[String]) -> Result<()> {
     let conn = Connection::system().await?;
     let manager = Login1ManagerProxy::new(&conn).await?;
     let sessions = manager.list_sessions().await?;
     let requested: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
-    let mut matched = HashSet::new();
+    let mut found = HashSet::new();
     let mut errors = Vec::new();
     let mut cinnamon_outcomes: HashMap<u32, CinnamonLockOutcome> = HashMap::new();
 
@@ -546,7 +570,20 @@ pub async fn lock_sessions(session_ids: &[String]) -> Result<()> {
         if !requested.contains(sid.as_str()) {
             continue;
         }
-        matched.insert(sid.as_str());
+
+        match classify_session(expected_uid, sid, Some((sid, *uid))) {
+            SessionTarget::StaleOwnership => {
+                found.insert(sid.as_str());
+                tracing::warn!(
+                    "refusing session={sid}: cached session ID is stale/reused \
+                     (expected uid={expected_uid}, live uid={uid}); skipping lock"
+                );
+                continue;
+            }
+            SessionTarget::Missing => continue,
+            SessionTarget::Valid => {}
+        }
+        found.insert(sid.as_str());
 
         let session = match Login1SessionProxy::builder(&conn)
             .path(path.as_ref())
@@ -590,14 +627,14 @@ pub async fn lock_sessions(session_ids: &[String]) -> Result<()> {
         let cinnamon_outcome = if !cinnamon_backend_applies(desktop.as_deref()) {
             CinnamonLockOutcome::NotApplicable
         } else {
-            cinnamon_outcome_for_session(*uid, &mut cinnamon_outcomes, || {
-                cinnamon_lock_for_uid(*uid)
+            cinnamon_outcome_for_session(expected_uid, &mut cinnamon_outcomes, || {
+                cinnamon_lock_for_uid(expected_uid)
             })
             .await
         };
 
         let result = lock_with_fallback(
-            *uid,
+            expected_uid,
             sid,
             || async { cinnamon_outcome },
             || async move {
@@ -612,7 +649,7 @@ pub async fn lock_sessions(session_ids: &[String]) -> Result<()> {
         }
     }
 
-    for session_id in requested.difference(&matched) {
+    for session_id in requested.difference(&found) {
         tracing::debug!(
             "Requested session={session_id} disappeared before it could be locked"
         );
@@ -631,42 +668,84 @@ pub async fn lock_sessions(session_ids: &[String]) -> Result<()> {
 
 /// Unlock all sessions in the given list via DBus.
 /// Called when enforcement is lifted (e.g. admin grants more time).
-pub async fn unlock_sessions(session_ids: &[String]) -> Result<()> {
+pub async fn unlock_sessions(expected_uid: u32, session_ids: &[String]) -> Result<()> {
     let conn = Connection::system().await?;
     let manager = Login1ManagerProxy::new(&conn).await?;
     let sessions = manager.list_sessions().await?;
 
-    for (sid, _uid, _user, _seat, path) in &sessions {
-        if session_ids.contains(sid)
-            && let Ok(session) = Login1SessionProxy::builder(&conn)
-                .path(path.as_ref())?
-                .build()
-                .await
-            {
-                let _ = session.unlock().await;
+    let mut found = HashSet::new();
+    let mut succeeded = Vec::new();
+    for (sid, live_uid, _user, _seat, path) in &sessions {
+        if !session_ids.contains(sid) {
+            continue;
+        }
+        match classify_session(expected_uid, sid, Some((sid, *live_uid))) {
+            SessionTarget::StaleOwnership => {
+                found.insert(sid.as_str());
+                tracing::warn!(
+                    "refusing session={sid}: cached session ID is stale/reused \
+                     (expected uid={expected_uid}, live uid={live_uid}); skipping unlock"
+                );
+                continue;
             }
+            SessionTarget::Missing => continue,
+            SessionTarget::Valid => found.insert(sid.as_str()),
+        };
+        let Ok(builder) = Login1SessionProxy::builder(&conn).path(path.as_ref()) else {
+            continue;
+        };
+        let Ok(session) = builder.build().await else {
+            continue;
+        };
+        if session.unlock().await.is_ok() {
+            succeeded.push(sid.clone());
+        }
     }
-    tracing::info!("Unlocked {} session(s): {:?}", session_ids.len(), session_ids);
+    for session_id in session_ids.iter().filter(|sid| !found.contains(sid.as_str())) {
+        tracing::debug!("Requested session={session_id} disappeared before it could be unlocked");
+    }
+    tracing::info!("Unlocked {} session(s): {:?}", succeeded.len(), succeeded);
     Ok(())
 }
 
 /// Terminate all sessions in the given list via DBus.
-pub async fn terminate_sessions(session_ids: &[String]) -> Result<()> {
+pub async fn terminate_sessions(expected_uid: u32, session_ids: &[String]) -> Result<()> {
     let conn = Connection::system().await?;
     let manager = Login1ManagerProxy::new(&conn).await?;
     let sessions = manager.list_sessions().await?;
 
-    for (sid, _uid, _user, _seat, path) in &sessions {
-        if session_ids.contains(sid)
-            && let Ok(session) = Login1SessionProxy::builder(&conn)
-                .path(path.as_ref())?
-                .build()
-                .await
-            {
-                let _ = session.terminate().await;
+    let mut found = HashSet::new();
+    let mut succeeded = Vec::new();
+    for (sid, live_uid, _user, _seat, path) in &sessions {
+        if !session_ids.contains(sid) {
+            continue;
+        }
+        match classify_session(expected_uid, sid, Some((sid, *live_uid))) {
+            SessionTarget::StaleOwnership => {
+                found.insert(sid.as_str());
+                tracing::warn!(
+                    "refusing session={sid}: cached session ID is stale/reused \
+                     (expected uid={expected_uid}, live uid={live_uid}); skipping terminate"
+                );
+                continue;
             }
+            SessionTarget::Missing => continue,
+            SessionTarget::Valid => found.insert(sid.as_str()),
+        };
+        let Ok(builder) = Login1SessionProxy::builder(&conn).path(path.as_ref()) else {
+            continue;
+        };
+        let Ok(session) = builder.build().await else {
+            continue;
+        };
+        if session.terminate().await.is_ok() {
+            succeeded.push(sid.clone());
+        }
     }
-    tracing::info!("Terminated {} session(s): {:?}", session_ids.len(), session_ids);
+    for session_id in session_ids.iter().filter(|sid| !found.contains(sid.as_str())) {
+        tracing::debug!("Requested session={session_id} disappeared before it could be terminated");
+    }
+    tracing::info!("Terminated {} session(s): {:?}", succeeded.len(), succeeded);
     Ok(())
 }
 
@@ -757,9 +836,9 @@ trait Notifications {
 #[cfg(test)]
 mod tests {
     use super::{
-        cinnamon_backend_applies, cinnamon_outcome_for_session, lock_with_fallback,
-        session_counts_usage, uid_counts_usage, CinnamonLockOutcome, LockBackend,
-        SessionUsageState,
+        cinnamon_backend_applies, cinnamon_outcome_for_session, classify_session,
+        lock_with_fallback, session_counts_usage, uid_counts_usage, CinnamonLockOutcome,
+        LockBackend, SessionTarget, SessionUsageState,
     };
     use std::collections::HashMap;
     use std::sync::{
@@ -815,6 +894,27 @@ mod tests {
     fn no_qualifying_sessions_make_uid_not_count() {
         let states = [state(true, true, false), state(false, false, false)];
         assert!(!uid_counts_usage(&states));
+    }
+
+    #[test]
+    fn reused_session_id_is_classified_as_stale_ownership() {
+        assert_eq!(
+            classify_session(1001, "c9", Some(("c9", 1002))),
+            SessionTarget::StaleOwnership
+        );
+    }
+
+    #[test]
+    fn matching_session_id_and_uid_is_a_valid_target() {
+        assert_eq!(
+            classify_session(1001, "c2", Some(("c2", 1001))),
+            SessionTarget::Valid
+        );
+    }
+
+    #[test]
+    fn absent_requested_session_is_classified_as_missing() {
+        assert_eq!(classify_session(1001, "c9", None), SessionTarget::Missing);
     }
 
     #[test]
